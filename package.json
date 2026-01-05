@@ -1,0 +1,30 @@
+{
+  "name": "@mikroform/runtime",
+  "version": "0.1.0",
+  "description": "Runtime for Mikroform platform",
+  "keywords": [],
+  "main": "index.js",
+  "types": "index.d.ts",
+  "bin": {
+    "mikroform": "./index.js"
+  },
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mikroform/runtime.git"
+  },
+  "author": {
+    "name": "Alexander Andreev"
+  },
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/mikroform/runtime/issues"
+  },
+  "homepage": "https://github.com/mikroform/runtime#readme",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "tsx": "4.21.0"
+  }
+}
