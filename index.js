@@ -30,7 +30,9 @@ async function* packages(target) {
         }
       }
     } else {
-      yield [packageName, await import(packageName), packageConfig]
+      const fullPath = path.join(process.cwd(), 'node_modules', packageName);
+
+      yield [packageName, await import(fullPath), packageConfig]
     }
   }
 }
