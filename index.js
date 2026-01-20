@@ -1,8 +1,11 @@
-#!/usr/bin/env -S npx tsx
+#!/usr/bin/env -S npx tsx --experimental-vm-modules
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
+import vm from 'node:vm';
+
+import ts from 'typescript';
 
 function resolvePackage(target) {
   if (typeof target === 'string') {
@@ -14,7 +17,7 @@ function resolvePackage(target) {
   }
 }
 
-async function* packages(target) {
+async function* packages(target, withImport) {
   let currentIdx = -1
 
   while (++currentIdx < target.length) {
@@ -22,17 +25,27 @@ async function* packages(target) {
 
     if (packageName.startsWith('.') || packageName.startsWith('/')) {
       for await (const filePath of fs.glob(packageName)) {
-        const fullPath = path.join(process.cwd(), filePath)
+        const fullPath = packageName.startsWith('.') ?
+          path.join(process.cwd(), filePath) :
+          filePath
         const stats = await fs.stat(fullPath)
 
         if (stats.isFile() && (fullPath.endsWith('.js') || fullPath.endsWith('.ts'))) {
-          yield [fullPath, await import(fullPath), packageConfig]
+          yield [
+            fullPath,
+            withImport ? await import(fullPath) : await fs.readFile(fullPath, 'utf8'),
+            packageConfig,
+          ]
         }
       }
     } else {
       const fullPath = path.join(process.cwd(), 'node_modules', packageName);
 
-      yield [packageName, await import(fullPath), packageConfig]
+      yield [
+        packageName,
+        withImport ? await import(fullPath) : await fs.readFile(fullPath, 'utf8'),
+        packageConfig,
+      ]
     }
   }
 }
@@ -85,14 +98,14 @@ const errors = {
   AlreadyExistsError,
   DeletedError,
   LogicError,
-};
+}
 
 const moduleByPackageName = new Map()
 const coreModules = new Set()
 const modulesQueue = Array.from(config?.modules ?? [])
 const childSymbol = Symbol('child')
 
-for await (const [packageName, module, packageConfig] of packages(modulesQueue)) {
+for await (const [packageName, module, packageConfig] of packages(modulesQueue, true)) {
   let loadModule
 
   if (typeof module === 'function') {
@@ -112,7 +125,9 @@ for await (const [packageName, module, packageConfig] of packages(modulesQueue))
   for (const requiredPackage of loadModule.require ?? []) {
     const [requiredPackageName, requiredPackageConfig] = resolvePackage(requiredPackage)
 
-    modulesQueue.push([requiredPackageName, {[childSymbol]: true, ...requiredPackageConfig}])
+    if (!moduleByPackageName.has(requiredPackageName)) {
+      modulesQueue.push([requiredPackageName, {[childSymbol]: true, ...requiredPackageConfig}])
+    }
   }
 }
 
@@ -170,24 +185,86 @@ for (const packageName of coreModules) {
   modules[module.name] = module.action
 }
 
+const vmContext = new vm.createContext({})
+const serviceByFilePath = new Map()
+const coreServices = new Set()
+const servicesQueue = Array.from(config?.services ?? [['./services/*.[jt]s']])
+
+for await (const [filePath, serviceFile, packageConfig] of packages(servicesQueue, false)) {
+  let srcText = serviceFile
+
+  if (filePath.endsWith('.ts') || filePath.endsWith('.mts') || filePath.endsWith('.cts')) {
+    srcText = ts.transpileModule(serviceFile, {
+      fileName: filePath,
+      compilerOptions: {
+        target: 'esnext',
+        module: 'esnext',
+      },
+    }).outputText
+  }
+
+  const compiledModule = new vm.SourceTextModule(srcText, {
+    identifier: filePath,
+    context: vmContext,
+  })
+
+  serviceByFilePath.set(filePath, [compiledModule, packageConfig])
+
+  if (!packageConfig?.[childSymbol]) {
+    coreServices.add(filePath)
+  }
+
+  for (const dependency of compiledModule.moduleRequests ?? []) {
+    const fullPath = path.join(filePath, '..', dependency.specifier)
+
+    if (!serviceByFilePath.has(fullPath)) {
+      servicesQueue.push([fullPath, {[childSymbol]: true, ...packageConfig}])
+    }
+  }
+  for (const dependency of compiledModule.dependencySpecifiers ?? []) {
+    const fullPath = path.join(filePath, '..', dependency)
+
+    if (!serviceByFilePath.has(fullPath)) {
+      servicesQueue.push([fullPath, {[childSymbol]: true, ...packageConfig}])
+    }
+  }
+}
+
 const services = {}
 
-for await (const [, service] of packages(config?.services ?? ['./services/*.[jt]s'])) {
-  if (typeof service === 'function') {
-    services[service.name] = (params) => service(params, modules, errors)
-  } else if (service.default && typeof service.default === 'function' && service.default.name) {
-    services[service.default.name] = (params) => service.default(params, modules, errors)
-  } else if (typeof service === 'object') {
-    let localServices = {}
+for (const service of coreServices) {
+  const [compiledModule] = serviceByFilePath.get(service)
 
-    if (typeof service.default === 'object') {
-      localServices = service.default
-    } else if (typeof service === 'object') {
-      localServices = service
+  await compiledModule.link(async(specifier) => {
+    if (!serviceByFilePath.has(path.join(service, '..', specifier))) {
+      throw new Error(`module ${specifier} not found`)
+    }
+
+    return serviceByFilePath.get(path.join(service, '..', specifier))[0];
+  })
+  await compiledModule.evaluate()
+
+  const exports = compiledModule.namespace
+
+  if (typeof exports === 'function') {
+    services[exports.name] = (params) => exports(params, modules, errors)
+  } else if (typeof exports === 'object') {
+    const defaultExport = exports.default
+
+    if (typeof defaultExport === 'function') {
+      services[defaultExport.name] = (params) => defaultExport(params, modules, errors)
+    }
+
+    let localServices
+
+    if (typeof defaultExport === 'object') {
+      localServices = defaultExport
+    } else {
+      localServices = exports
     }
 
     for (const name in localServices) {
-      services[name] = (params) => service[name](params, modules, errors)
+      services[name] = (params) => localServices[name](params, modules, errors)
     }
   } else {
     throw new TypeError('service must be a function or object of functions')
@@ -196,7 +273,7 @@ for await (const [, service] of packages(config?.services ?? ['./services/*.[jt]
 
 const appByName = new Map()
 
-for await (const [packageName, app, appConfig] of packages(config?.apps ?? [])) {
+for await (const [packageName, app, appConfig] of packages(config?.apps ?? [], true)) {
   let loadApp
 
   if (typeof app === 'function') {

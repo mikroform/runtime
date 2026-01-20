@@ -10,3 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Support global installation of runtime for improved developer experience.
+
+## [0.2.0] - 2026-01-21
+
+### Changed
+
+- Isolate services from NodeJS ecosystem via node:vm.
